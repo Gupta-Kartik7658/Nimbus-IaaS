@@ -1,0 +1,4 @@
+*.ssh
+*.vagrant
+*Vagrantfile
+.nimbus
