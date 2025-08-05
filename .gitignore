@@ -1,0 +1,7 @@
+*.ssh
+*.vagrant
+*Vagrantfile
+.nimbus
+.vms
+__pycache__
+__pycache__/*
