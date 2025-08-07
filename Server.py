@@ -277,6 +277,7 @@ async def delete_vm(username: str):
 def forward_and_expose_ports(vm: VirtualMachine):
     try:
         private_ip = vm.private_ip
+        
         for rule in vm.inbound_rules:
             ssh_cmd = [
                 "ssh",
@@ -287,8 +288,6 @@ def forward_and_expose_ports(vm: VirtualMachine):
                 "-L", f"{rule.localhost_port}:{private_ip}:{rule.vm_port}",
                 f"{vm.username}@{private_ip}"
             ]
-            
-
             def ssh_tunnel():
                 print(f"[SSH] Forwarding localhost:{rule.localhost_port} → {private_ip}:{rule.vm_port}...")
                 subprocess.run(ssh_cmd)
@@ -329,34 +328,16 @@ async def expose_vm(username: str, background_tasks: BackgroundTasks):
         key_name = metadata["key_name"]
 
         # Load VM's Vagrantfile to get box username (or assume `username`)
-        vm_path = f".vms/{username}"
-        config_path = os.path.join(vm_path, "inbound_rules.json")
 
-        if not os.path.exists(config_path):
-            raise HTTPException(status_code=404, detail="Inbound rules not configured.")
-
-        with open(config_path, "r") as f:
-            rules = json.load(f)
         vm = VirtualMachine(
             username=username,
             key_name=metadata["key_name"],
-            ram=metadata['ram'], cpu=metadata['cpu'], image=metadata['image'],
+            ram=metadata['ram'], 
+            cpu=metadata['cpu'], 
+            image=metadata['image'],
             inbound_rules=metadata["inbound_rules"],
             private_ip=private_ip
         )
-        
-        
-        for rule in vm.inbound_rules:
-            ssh_cmd = [
-                "ssh",
-                "-i", f".ssh/{vm.key_name}",
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-N",
-                "-L", f"{rule.localhost_port}:{private_ip}:{rule.vm_port}",
-                f"{vm.username}@{private_ip}"
-            ]
-            print(ssh_cmd,end="\n")
 
         background_tasks.add_task(forward_and_expose_ports, vm)
 
