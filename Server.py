@@ -109,43 +109,78 @@ async def download_key(key_name: str):
 
 
 #region --- Vagrantfile Generation ---
-def get_vagrantfile_content(vm: VirtualMachine, private_ip) -> str:
+def get_vagrantfile_content(vm: VirtualMachine, private_ip: str) -> str:
     pub_key_path = SSH_DIR / f"{vm.key_name}.pub"
     if not pub_key_path.exists():
         raise FileNotFoundError(f"Public key file not found: {pub_key_path}")
 
-    # Escape backslashes for Vagrant's Ruby parser
+    # This ensures the path is correctly formatted for Vagrant
     pub_key_path_str = str(pub_key_path).replace("\\", "/")
+
+    # --- Prepare the custom provisioning script to be injected ---
+    # We will run this at the end of the main script block
+    custom_script_injection = ""
+    if vm.provisioning_script:
+        custom_script_injection = f"""
+    echo "--- Running Custom User Provisioning Script ---"
+    # Run the custom script as the new user for better isolation and security
+    sudo -i -u {vm.username} bash <<'EOF'
+{vm.provisioning_script}
+EOF
+    echo "--- Custom Script Finished ---"
+"""
 
     return f"""
 Vagrant.configure("2") do |config|
     NEW_USERNAME = "{vm.username}"
-    NEW_HOSTNAME = "{vm.username}"
+
     config.vm.box = "{vm.image}"
     config.vm.network "private_network", ip: "{private_ip}"
-    config.vm.hostname = NEW_HOSTNAME
+    config.vm.hostname = "{vm.username}"
+
     config.vm.provider "virtualbox" do |vb|
         vb.memory = "{vm.ram}"
         vb.cpus = "{vm.cpu}"
     end
-    config.ssh.insert_key = false
+
+    config.ssh.insert_key = true  # Let Vagrant manage the vagrant user's key
+
     config.vm.provision "file", source: "{pub_key_path_str}", destination: "/tmp/user_public_key.pub"
+
     config.vm.provision "shell", inline: <<-SHELL
         NEW_USERNAME="{vm.username}"
         echo "Provisioning VM with user '$NEW_USERNAME'..."
+
+        # 1. Create the user
         useradd --create-home --shell /bin/bash "$NEW_USERNAME"
-        usermod -aG wheel "$NEW_USERNAME"
-        echo "$NEW_USERNAME ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/$NEW_USERNAME
-        chmod 440 /etc/sudoers.d/$NEW_USERNAME
+
+        # 2. Grant Passwordless Sudo (Universal Method)
+        if command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+            usermod -aG wheel "$NEW_USERNAME"
+            sed -i 's/^Defaults.*requiretty/#&/' /etc/sudoers
+            if ! grep -q '^%wheel ALL=(ALL) NOPASSWD: ALL' /etc/sudoers; then
+                echo '%wheel ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+            fi
+        elif command -v apt-get >/dev/null 2>&1; then
+            usermod -aG sudo "$NEW_USERNAME"
+            echo "$NEW_USERNAME ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$NEW_USERNAME
+            chmod 440 /etc/sudoers.d/$NEW_USERNAME
+        fi
+
+        # 3. Setup SSH key for the new user
         mkdir -p /home/$NEW_USERNAME/.ssh
         cat /tmp/user_public_key.pub > /home/$NEW_USERNAME/.ssh/authorized_keys
         chown -R $NEW_USERNAME:$NEW_USERNAME /home/$NEW_USERNAME/.ssh
         chmod 700 /home/$NEW_USERNAME/.ssh
         chmod 600 /home/$NEW_USERNAME/.ssh/authorized_keys
-        sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+
+        # 4. Restart SSH daemon (AFTER provisioning)
         systemctl restart sshd || systemctl restart ssh
-        {vm.provisioning_script if vm.provisioning_script else ""}
-        echo "Provisioning complete."
+
+        echo "--- Base Provisioning Complete ---"
+
+        # 5. Inject and run the custom user script
+        {custom_script_injection}
     SHELL
 end
 """
@@ -211,7 +246,6 @@ def find_available_remotePort(exclude_ports: Set[int] = None, start=2222, end=30
 
 
 
-#region --- Managing Firewall Layers ---
 #region --- AWS Security Group Management ---
 EC2_CLIENT = boto3.client("ec2", region_name="ap-south-1") # Use your region
 SECURITY_GROUP_ID = "sg-0b0cb6352cf1c28be" # <-- IMPORTANT: Replace with your actual Security Group ID
@@ -269,55 +303,6 @@ def remove_inbound_security_rule(port: int):
             return False
 #endregion    
 
-
-#region --- Host machine Firewall rules management ---
-## NEW ## --- Host Firewall (Windows) Management Functions ---
-
-def add_host_firewall_rule(vm_private_ip: str, vm_username: str):
-    """Adds a rule to Windows Firewall to allow traffic FROM a new VM."""
-    rule_name = f"Nimbus-IaaS: Allow VM {vm_username}"
-    try:
-        # Command to add a new inbound rule
-        # Example: netsh advfirewall firewall add rule name="Nimbus-IaaS: Allow VM web-server-01" dir=in action=allow remoteip=192.168.56.11
-        command = [
-            "netsh", "advfirewall", "firewall", "add", "rule",
-            f'name="{rule_name}"',
-            "dir=in",
-            "action=allow",
-            f"remoteip={vm_private_ip}"
-        ]
-        print(f"HOST FIREWALL: Adding rule: {' '.join(command)}")
-        # We use shell=True on Windows for netsh to work reliably with quotes
-        subprocess.run(" ".join(command), check=True, capture_output=True, text=True, shell=True)
-        print(f"HOST FIREWALL: Successfully allowed traffic from {vm_private_ip}")
-    except subprocess.CalledProcessError as e:
-        # This error often means the rule already exists, which is fine.
-        if "Ok." in e.stdout or "already exists" in e.stderr:
-            print(f"HOST FIREWALL: Rule '{rule_name}' may already exist.")
-        else:
-            print(f"HOST FIREWALL: Error adding rule for {vm_private_ip}: {e.stderr.strip()}")
-
-def remove_host_firewall_rule(vm_username: str):
-    """Removes a rule from Windows Firewall by its name."""
-    rule_name = f"Nimbus-IaaS: Allow VM {vm_username}"
-    try:
-        # Command to delete a firewall rule by its unique name
-        # Example: netsh advfirewall firewall delete rule name="Nimbus-IaaS: Allow VM web-server-01"
-        command = [
-            "netsh", "advfirewall", "firewall", "delete", "rule",
-            f'name="{rule_name}"'
-        ]
-        print(f"HOST FIREWALL: Removing rule: {' '.join(command)}")
-        subprocess.run(" ".join(command), check=True, capture_output=True, text=True, shell=True)
-        print(f"HOST FIREWALL: Successfully removed rule '{rule_name}'")
-    except subprocess.CalledProcessError as e:
-        # It's okay if the rule doesn't exist when we try to delete it.
-        if "No rules match the specified criteria" in e.stdout:
-             print(f"HOST FIREWALL: Rule '{rule_name}' not found, nothing to delete.")
-        else:
-            print(f"HOST FIREWALL: Error deleting rule '{rule_name}': {e.stderr.strip()}")
-#endregion
-#endregion
 
 
 
