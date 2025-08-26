@@ -306,6 +306,8 @@ def remove_inbound_security_rule(port: int):
 
 
 
+
+
 #region --- FRPC Process Management Functions ---
 def start_frpc():
     global frpc_process
@@ -343,6 +345,60 @@ def restart_frpc_background(background_tasks: BackgroundTasks):
     
     
 #region  Vagrant commands and VM management endpoints
+
+
+
+
+
+
+@app.post('/add-inbound-rule/{port}')
+async def add_inbound_rule(port: int, description: str, username: str,background_tasks: BackgroundTasks):
+    if port < 1 or port > 65535:
+        raise HTTPException(status_code=400, detail="Port must be between 1 and 65535.")
+    
+    success = add_inbound_security_rule(port, description)
+    
+    
+    registry = load_vm_registry()
+    vm = registry.get(username)
+    
+    if not vm:
+        raise HTTPException(status_code=404, detail=f"VM '{username}' not found in registry.")
+    
+    remotePort  = find_available_remotePort()
+    for rule in vm.get("inbound_rules", []):
+        if rule.get("vm_port") == port:
+            return {"message": f"Inbound rule for port {port} already exists for VM '{username}'."}
+        
+    vm["inbound_rules"].append({"type": "tcp", "vm_port": port, "remotePort": remotePort})
+    save_vm_registry(registry)
+    add_inbound_security_rule(remotePort, f"Tunnel for {username} on port {remotePort}")
+    
+    
+    proxy_name = f"{username}-{port}"
+            ## FIXED ## --- Changed remotePort to remotePort ---
+    new_proxy_toml = f"""
+[[proxies]]
+name = "{proxy_name}"
+type = "tcp"
+localIP = "{vm.private_ip}"
+localPort = {port}
+remotePort = {remotePort}
+"""
+
+    with open(FRP_CONFIG_PATH, "a") as f:
+        f.write(new_proxy_toml)
+        print(f"Appended {len(new_proxy_toml)} proxies for '{username}' to frpc.toml")
+    restart_frpc_background(background_tasks)
+    
+    if not success:
+        raise HTTPException(status_code=500, detail=f"Failed to add inbound rule for port {port}.")
+    return {"message": f"Inbound rule for port {port} added successfully."}
+
+
+
+
+
 
 #region --- Create VM Endpoint ---
 @app.post("/create-vm")
