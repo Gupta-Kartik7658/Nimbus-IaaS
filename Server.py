@@ -118,7 +118,6 @@ def get_vagrantfile_content(vm: VirtualMachine, private_ip: str) -> str:
     pub_key_path_str = str(pub_key_path).replace("\\", "/")
 
     # --- Prepare the custom provisioning script to be injected ---
-    # We will run this at the end of the main script block
     custom_script_injection = ""
     if vm.provisioning_script:
         custom_script_injection = f"""
@@ -143,11 +142,14 @@ Vagrant.configure("2") do |config|
         vb.cpus = "{vm.cpu}"
     end
 
-    config.ssh.insert_key = true  # Let Vagrant manage the vagrant user's key
+    config.ssh.insert_key = false
 
     config.vm.provision "file", source: "{pub_key_path_str}", destination: "/tmp/user_public_key.pub"
 
-    config.vm.provision "shell", inline: <<-SHELL
+    # --- THIS IS THE CORRECTED BLOCK ---
+    config.vm.provision "shell", privileged: true, inline: <<-SHELL
+        set -x # Enable debugging output
+
         NEW_USERNAME="{vm.username}"
         echo "Provisioning VM with user '$NEW_USERNAME'..."
 
@@ -232,7 +234,8 @@ def find_available_remotePort(exclude_ports: Set[int] = None, start=2222, end=30
     used_ports = set()
     for vm in registry.values():
         for rule in vm.get("inbound_rules", []):
-            if "" in rule:
+            # --- THIS IS THE CORRECTED LINE ---
+            if "remotePort" in rule:
                 used_ports.add(rule["remotePort"])
     
     # Combine saved ports with ports assigned in the current request
@@ -336,10 +339,38 @@ def stop_frpc():
     print("frpc stopped.")
     frpc_process = None
 
-def restart_frpc_background(background_tasks: BackgroundTasks):
-    background_tasks.add_task(stop_frpc)
+# def reload_frpc_background(background_tasks: BackgroundTasks):
+#     background_tasks.add_task(stop_frpc)
+#     background_tasks.add_task(time.sleep, 1)
+#     background_tasks.add_task(start_frpc)
+    
+    
+def execute_frpc_reload():
+    """Executes the frpc reload command."""
+    if not frpc_process or not psutil.pid_exists(frpc_process.pid):
+        print("frpc is not running, so not reloading. It will start on the next request or app start.")
+        return
+
+    print("Attempting to hot-reload frpc configuration...")
+    try:
+        # This command tells the running frpc process to reload its config
+        reload_command = [str(FRP_EXECUTABLE_PATH), "reload", "-c", str(FRP_CONFIG_PATH)]
+        result = subprocess.run(reload_command, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            print("frpc reloaded successfully.")
+        else:
+            print(f"ERROR: frpc reload failed. Stderr: {result.stderr.strip()}")
+            print("Please ensure the '[admin]' section is configured in frpc.toml.")
+
+    except Exception as e:
+        print(f"An exception occurred while trying to reload frpc: {e}")
+
+def reload_frpc_background(background_tasks: BackgroundTasks):
+    """Schedules a non-blocking frpc reload task."""
+    # We add a tiny delay to ensure the file write has completed before reload.
     background_tasks.add_task(time.sleep, 1)
-    background_tasks.add_task(start_frpc)
+    background_tasks.add_task(execute_frpc_reload)
 #endregion
     
     
@@ -381,7 +412,7 @@ async def add_inbound_rule(port: int, description: str, username: str,background
 [[proxies]]
 name = "{proxy_name}"
 type = "tcp"
-localIP = "{vm.private_ip}"
+localIP = "{vm['private_ip']}"
 localPort = {port}
 remotePort = {remotePort}
 """
@@ -389,7 +420,7 @@ remotePort = {remotePort}
     with open(FRP_CONFIG_PATH, "a") as f:
         f.write(new_proxy_toml)
         print(f"Appended {len(new_proxy_toml)} proxies for '{username}' to frpc.toml")
-    restart_frpc_background(background_tasks)
+    reload_frpc_background(background_tasks)
     
     if not success:
         raise HTTPException(status_code=500, detail=f"Failed to add inbound rule for port {port}.")
@@ -451,7 +482,7 @@ remotePort = {remotePort}
             f.write(vagrantfile_content)
 
         background_tasks.add_task(stream_vagrant_up, str(vm_path))
-        restart_frpc_background(background_tasks)
+        reload_frpc_background(background_tasks)
 
         return {"message": f"VM '{vm.username}' is being provisioned. Tunnels are being configured."}
 
@@ -518,7 +549,7 @@ async def delete_vm(username: str, background_tasks: BackgroundTasks):
                 # --- End of replaced block ---
 
                 print(f"Removed proxies for '{username}' from frpc.toml")
-                restart_frpc_background(background_tasks)
+                reload_frpc_background(background_tasks)
 
             del registry[username]
             save_vm_registry(registry)
