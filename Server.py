@@ -13,6 +13,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import boto3
 from botocore.exceptions import ClientError
+from fastapi.middleware.cors import CORSMiddleware
+ 
 # endregion
 
 
@@ -52,6 +54,23 @@ app = FastAPI(
     description="An API to manage local VMs and their frp tunnels.",
     lifespan=lifespan
 )
+
+# NEW: Add the CORS middleware configuration
+# This tells the backend to accept requests from your React app's origin
+origins = [
+    "http://localhost:5173", # The address of your React frontend
+    "http://localhost:3000", # A common alternative for React dev servers
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"], # Allows all methods (GET, POST, etc.)
+    allow_headers=["*"], # Allows all headers
+)
+
+
 #endregion
 
 
@@ -60,6 +79,13 @@ app = FastAPI(
 class InboundRule(BaseModel):
     type: Literal["http", "tcp","ssh","udp","icmp"]
     vm_port: int
+    description: Optional[str] = ""
+    
+# 1. NEW: Add this Pydantic model for the request body
+class AddRuleBody(BaseModel):
+    username: str
+    description: str
+
 
 class VirtualMachine(BaseModel):
     username: str
@@ -67,7 +93,7 @@ class VirtualMachine(BaseModel):
     ram: int
     cpu: int
     image: str
-    inbound_rules: List[InboundRule]
+    inbound_rules: List[InboundRule] = [InboundRule(type="tcp", vm_port=22, description="SSH Access")]
     provisioning_script: Optional[str] = None
 #endregion
     
@@ -104,6 +130,14 @@ async def download_key(key_name: str):
         raise HTTPException(status_code=404, detail=f"Key '{key_name}' does not exist.")
     return FileResponse(path=private_key_path, filename=key_name, media_type='application/octet-stream')
 
+@app.get("/list-keys/")
+async def download_key():
+    keys = []
+    for i in SSH_DIR.glob("*"):
+        if(i.suffix == ".pub"):
+            keys.append(i.name)
+    return keys
+
 #endregion
 
 
@@ -118,7 +152,6 @@ def get_vagrantfile_content(vm: VirtualMachine, private_ip: str) -> str:
     pub_key_path_str = str(pub_key_path).replace("\\", "/")
 
     # --- Prepare the custom provisioning script to be injected ---
-    # We will run this at the end of the main script block
     custom_script_injection = ""
     if vm.provisioning_script:
         custom_script_injection = f"""
@@ -143,11 +176,14 @@ Vagrant.configure("2") do |config|
         vb.cpus = "{vm.cpu}"
     end
 
-    config.ssh.insert_key = true  # Let Vagrant manage the vagrant user's key
+    config.ssh.insert_key = false
 
     config.vm.provision "file", source: "{pub_key_path_str}", destination: "/tmp/user_public_key.pub"
 
-    config.vm.provision "shell", inline: <<-SHELL
+    # --- THIS IS THE CORRECTED BLOCK ---
+    config.vm.provision "shell", privileged: true, inline: <<-SHELL
+        set -x # Enable debugging output
+
         NEW_USERNAME="{vm.username}"
         echo "Provisioning VM with user '$NEW_USERNAME'..."
 
@@ -232,7 +268,8 @@ def find_available_remotePort(exclude_ports: Set[int] = None, start=2222, end=30
     used_ports = set()
     for vm in registry.values():
         for rule in vm.get("inbound_rules", []):
-            if "" in rule:
+            # --- THIS IS THE CORRECTED LINE ---
+            if "remotePort" in rule:
                 used_ports.add(rule["remotePort"])
     
     # Combine saved ports with ports assigned in the current request
@@ -336,66 +373,162 @@ def stop_frpc():
     print("frpc stopped.")
     frpc_process = None
 
-def restart_frpc_background(background_tasks: BackgroundTasks):
-    background_tasks.add_task(stop_frpc)
+# def reload_frpc_background(background_tasks: BackgroundTasks):
+#     background_tasks.add_task(stop_frpc)
+#     background_tasks.add_task(time.sleep, 1)
+#     background_tasks.add_task(start_frpc)
+    
+    
+def execute_frpc_reload():
+    """Executes the frpc reload command."""
+    if not frpc_process or not psutil.pid_exists(frpc_process.pid):
+        print("frpc is not running, so not reloading. It will start on the next request or app start.")
+        return
+
+    print("Attempting to hot-reload frpc configuration...")
+    try:
+        # This command tells the running frpc process to reload its config
+        reload_command = [str(FRP_EXECUTABLE_PATH), "reload", "-c", str(FRP_CONFIG_PATH)]
+        result = subprocess.run(reload_command, capture_output=True, text=True)
+
+        if result.returncode == 0:
+            print("frpc reloaded successfully.")
+        else:
+            print(f"ERROR: frpc reload failed. Stderr: {result.stderr.strip()}")
+            print("Please ensure the '[admin]' section is configured in frpc.toml.")
+
+    except Exception as e:
+        print(f"An exception occurred while trying to reload frpc: {e}")
+
+def reload_frpc_background(background_tasks: BackgroundTasks):
+    """Schedules a non-blocking frpc reload task."""
+    # We add a tiny delay to ensure the file write has completed before reload.
     background_tasks.add_task(time.sleep, 1)
-    background_tasks.add_task(start_frpc)
+    background_tasks.add_task(execute_frpc_reload)
 #endregion
     
     
     
 #region  Vagrant commands and VM management endpoints
 
+# Add this endpoint to your FastAPI python file
 
-
-
+@app.get("/list-vms")
+async def list_vms():
+    """Returns the current VM registry."""
+    registry = load_vm_registry()
+    return registry
 
 
 @app.post('/add-inbound-rule/{port}')
-async def add_inbound_rule(port: int, description: str, username: str,background_tasks: BackgroundTasks):
+async def add_inbound_rule(port: int, body: AddRuleBody, background_tasks: BackgroundTasks):
     if port < 1 or port > 65535:
         raise HTTPException(status_code=400, detail="Port must be between 1 and 65535.")
-    
-    success = add_inbound_security_rule(port, description)
-    
-    
+
     registry = load_vm_registry()
-    vm = registry.get(username)
+    # Use body.username instead of username
+    vm = registry.get(body.username)
     
     if not vm:
-        raise HTTPException(status_code=404, detail=f"VM '{username}' not found in registry.")
+        # Use body.username instead of username
+        raise HTTPException(status_code=404, detail=f"VM '{body.username}' not found in registry.")
     
-    remotePort  = find_available_remotePort()
+    remotePort = find_available_remotePort()
     for rule in vm.get("inbound_rules", []):
         if rule.get("vm_port") == port:
-            return {"message": f"Inbound rule for port {port} already exists for VM '{username}'."}
-        
-    vm["inbound_rules"].append({"type": "tcp", "vm_port": port, "remotePort": remotePort})
+            # Use body.username instead of username
+            return {"message": f"Inbound rule for port {port} already exists for VM '{body.username}'."}
+            
+    vm["inbound_rules"].append({"type": "tcp", "vm_port": port, "description": body.description, "remotePort": remotePort})
     save_vm_registry(registry)
-    add_inbound_security_rule(remotePort, f"Tunnel for {username} on port {remotePort}")
+    # Use body.description instead of description
+    success = add_inbound_security_rule(remotePort, description=body.description)
     
-    
-    proxy_name = f"{username}-{port}"
-            ## FIXED ## --- Changed remotePort to remotePort ---
+    # Use body.username instead of username
+    proxy_name = f"{body.username}-{port}"
     new_proxy_toml = f"""
 [[proxies]]
 name = "{proxy_name}"
 type = "tcp"
-localIP = "{vm.private_ip}"
+localIP = "{vm['private_ip']}"
 localPort = {port}
 remotePort = {remotePort}
 """
 
     with open(FRP_CONFIG_PATH, "a") as f:
         f.write(new_proxy_toml)
-        print(f"Appended {len(new_proxy_toml)} proxies for '{username}' to frpc.toml")
-    restart_frpc_background(background_tasks)
+        # Use body.username instead of username
+        print(f"Appended proxy for '{body.username}' to frpc.toml")
+    reload_frpc_background(background_tasks)
     
     if not success:
         raise HTTPException(status_code=500, detail=f"Failed to add inbound rule for port {port}.")
     return {"message": f"Inbound rule for port {port} added successfully."}
 
+# Add this endpoint to your FastAPI python file
 
+@app.delete("/remove-inbound-rule/{username}/{remote_port}")
+async def remove_inbound_rule(username: str, remote_port: int, background_tasks: BackgroundTasks):
+    registry = load_vm_registry()
+    
+    # 1. Find the VM in the registry
+    if username not in registry:
+        raise HTTPException(status_code=404, detail=f"VM '{username}' not found.")
+    
+    vm_data = registry[username]
+    
+    # 2. Find the specific rule to remove by its remote_port
+    rule_to_remove = None
+    for rule in vm_data.get("inbound_rules", []):
+        if rule.get("remotePort") == remote_port:
+            rule_to_remove = rule
+            break
+
+    if not rule_to_remove:
+        raise HTTPException(status_code=404, detail=f"Rule with public port {remote_port} not found for VM '{username}'.")
+
+    # 3. Clean up resources associated with the rule
+    try:
+        # a. Remove the rule from the AWS security group
+        remove_inbound_security_rule(port=remote_port)
+        
+        # b. Remove the proxy from the frpc.toml file
+        vm_port = rule_to_remove["vm_port"]
+        proxy_name_to_delete = f"{username}-{vm_port}"
+        
+        with open(FRP_CONFIG_PATH, "r") as f:
+            lines = f.readlines()
+        
+        new_lines = []
+        in_proxy_to_delete = False
+        for line in lines:
+            if f'name = "{proxy_name_to_delete}"' in line:
+                in_proxy_to_delete = True
+                continue # Skip the 'name' line
+            if in_proxy_to_delete and line.strip() == "[[proxies]]":
+                in_proxy_to_delete = False # We've reached the next proxy block
+            
+            if not in_proxy_to_delete:
+                new_lines.append(line)
+        
+        # Clean up extra newlines that might result from the deletion
+        cleaned_content = "".join(new_lines).replace("\n\n[[proxies]]", "\n[[proxies]]")
+
+        with open(FRP_CONFIG_PATH, "w") as f:
+            f.write(cleaned_content)
+        
+        # c. Remove the rule from the registry object
+        vm_data["inbound_rules"].remove(rule_to_remove)
+        save_vm_registry(registry)
+        
+        # d. Reload the frpc service to apply changes
+        reload_frpc_background(background_tasks)
+
+        return {"message": f"Successfully removed rule for public port {remote_port}."}
+        
+    except Exception as e:
+        # If anything goes wrong, we should ideally roll back, but for now, we'll report the error.
+        raise HTTPException(status_code=500, detail=f"An error occurred while removing the rule: {str(e)}")
 
 
 
@@ -451,9 +584,9 @@ remotePort = {remotePort}
             f.write(vagrantfile_content)
 
         background_tasks.add_task(stream_vagrant_up, str(vm_path))
-        restart_frpc_background(background_tasks)
+        reload_frpc_background(background_tasks)
 
-        return {"message": f"VM '{vm.username}' is being provisioned. Tunnels are being configured."}
+        return {"message": f"You will now be able to SSH into your Nimbus-VM using ssh -i {vm.key_name} {vm.username}@13.233.204.203 -p {registry[vm.username]['inbound_rules'][0]['remotePort']}"}
 
     except Exception as e:
         registry = load_vm_registry()
@@ -518,7 +651,7 @@ async def delete_vm(username: str, background_tasks: BackgroundTasks):
                 # --- End of replaced block ---
 
                 print(f"Removed proxies for '{username}' from frpc.toml")
-                restart_frpc_background(background_tasks)
+                reload_frpc_background(background_tasks)
 
             del registry[username]
             save_vm_registry(registry)
@@ -535,6 +668,7 @@ async def delete_vm(username: str, background_tasks: BackgroundTasks):
 async def start_vm(username: str):
     try:
         vm_path = VMS_DIR / username
+        print(vm_path)
         if not vm_path.exists():
             raise HTTPException(status_code=404, detail=f"VM '{username}' does not exist.")
         start_proc = subprocess.run(["vagrant", "up"], cwd=vm_path, capture_output=True, text=True)
