@@ -488,35 +488,45 @@ async def remove_inbound_rule(username: str, remote_port: int, background_tasks:
         raise HTTPException(status_code=404, detail=f"Rule with public port {remote_port} not found for VM '{username}'.")
 
     # 3. Clean up resources associated with the rule
+    # ... inside the remove_inbound_rule function ...
+# ...
     try:
         # a. Remove the rule from the AWS security group
         remove_inbound_security_rule(port=remote_port)
         
-        # b. Remove the proxy from the frpc.toml file
+        # --- START OF REPLACED BLOCK ---
+        
+        # b. Remove the proxy from the frpc.toml file by processing it in blocks
         vm_port = rule_to_remove["vm_port"]
         proxy_name_to_delete = f"{username}-{vm_port}"
         
         with open(FRP_CONFIG_PATH, "r") as f:
-            lines = f.readlines()
+            content = f.read()
         
-        new_lines = []
-        in_proxy_to_delete = False
-        for line in lines:
-            if f'name = "{proxy_name_to_delete}"' in line:
-                in_proxy_to_delete = True
-                continue # Skip the 'name' line
-            if in_proxy_to_delete and line.strip() == "[[proxies]]":
-                in_proxy_to_delete = False # We've reached the next proxy block
-            
-            if not in_proxy_to_delete:
-                new_lines.append(line)
-        
-        # Clean up extra newlines that might result from the deletion
-        cleaned_content = "".join(new_lines).replace("\n\n[[proxies]]", "\n[[proxies]]")
+        # The first part is the server config, the rest are proxy blocks
+        parts = content.split("\n[[proxies]]\n")
+        server_config = parts[0]
+        proxy_blocks = parts[1:]
 
-        with open(FRP_CONFIG_PATH, "w") as f:
-            f.write(cleaned_content)
+        # Keep only the proxy blocks that we don't want to delete
+        kept_blocks = []
+        for block in proxy_blocks:
+            # Check if this block's name is in our deletion set
+            if not f'name = "{proxy_name_to_delete}"' in block:
+                kept_blocks.append(block)
+
+        # Rebuild the file content
+        new_content = server_config
+        if kept_blocks:
+            # Add the [[proxies]] delimiter back for each kept block
+            new_content += "\n[[proxies]]\n" + "\n[[proxies]]\n".join(kept_blocks)
         
+        # Write the new content back to the file
+        with open(FRP_CONFIG_PATH, "w") as f:
+            f.write(new_content)
+            
+        # --- END OF REPLACED BLOCK ---
+
         # c. Remove the rule from the registry object
         vm_data["inbound_rules"].remove(rule_to_remove)
         save_vm_registry(registry)
