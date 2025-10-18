@@ -2,7 +2,7 @@ import axios from 'axios';
 
 // Configure the base URL for your FastAPI backend
 const apiClient = axios.create({
-  baseURL: 'http://127.0.0.1:8000', // Your backend server address
+  baseURL: 'http://13.233.204.203:8000', // Your backend server address
   headers: {
     'Content-Type': 'application/json',
   },
