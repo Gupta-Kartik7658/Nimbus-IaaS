@@ -14,6 +14,7 @@ from pydantic import BaseModel
 import boto3
 from botocore.exceptions import ClientError
 from fastapi.middleware.cors import CORSMiddleware
+import asyncio
  
 # endregion
 
@@ -29,6 +30,7 @@ FRP_DIR = BASE_DIR / "frp_0.59.0_windows_amd64"  # Adjust this path as needed
 FRP_EXECUTABLE_PATH = FRP_DIR / "frpc.exe" # Or "frpc" on Linux/macOS
 FRP_CONFIG_PATH = FRP_DIR / "frpc.toml"
 frpc_process = None # Global variable to hold the frpc process
+REGISTRY_LOCK = asyncio.Lock()
 #endregion
 
 
@@ -101,7 +103,7 @@ class VirtualMachine(BaseModel):
     
 #region --- SSH Key Management ---
 @app.post("/generate-key/{key_name}")
-async def generate_key(key_name: str):
+def generate_key(key_name: str):
     try:
         if not key_name.isalnum() or " " in key_name:
             raise HTTPException(status_code=400, detail="Key name must be alphanumeric and contain no spaces.")
@@ -235,6 +237,85 @@ def stream_vagrant_up(vm_path: str):
     except Exception as e:
         print(f"[ERROR] Exception during Vagrant up: {e}")
 
+def stream_vagrant_halt(vm_path: str):
+    """Runs 'vagrant halt' in a blocking way, intended for a background task."""
+    try:
+        process = subprocess.Popen(["vagrant", "halt"], cwd=vm_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in process.stdout:
+            print(f"[VAGRANT HALT]: {line}", end="")
+        process.wait()
+        print(f"[INFO] Vagrant halt exited with code: {process.returncode}")
+    except Exception as e:
+        print(f"[ERROR] Exception during Vagrant halt: {e}")
+async def delete_vm_background(username: str):
+    """Runs the full VM deletion and cleanup process in the background."""
+    try:
+        vm_path = VMS_DIR / username
+        if not vm_path.exists():
+            print(f"[DELETE {username}] VM path not found. Checking registry...")
+            # Check registry just in case, but don't lock yet
+            registry_check = await asyncio.to_thread(load_vm_registry)
+            if username not in registry_check:
+                print(f"[DELETE {username}] VM not in registry. Nothing to do.")
+                return
+
+        # --- FIX: Run blocking subprocesses in a thread ---
+        print(f"[DELETE {username}] Destroying Vagrant VM...")
+        destroy_proc = await asyncio.to_thread(
+            subprocess.run,
+            ["vagrant", "destroy", "-f"], 
+            cwd=vm_path, 
+            capture_output=True, 
+            text=True
+        )
+        if destroy_proc.returncode != 0:
+            print(f"[DELETE {username}] Warning: Vagrant destroy failed, but proceeding with cleanup. Error: {destroy_proc.stderr.strip()}")
+
+        if vm_path.exists():
+            await asyncio.to_thread(rmtree, vm_path)
+            print(f"[DELETE {username}] Removed VM directory: {vm_path}")
+
+        proxy_names_to_delete = set()
+        
+        # --- FIX: Acquire lock to modify shared state ---
+        async with REGISTRY_LOCK:
+            registry = await asyncio.to_thread(load_vm_registry)
+            if username in registry:
+                vm_to_delete = registry[username]
+                
+                for rule in vm_to_delete.get("inbound_rules", []):
+                    proxy_names_to_delete.add(f"{username}-{rule['vm_port']}")
+                    if "remotePort" in rule:
+                        # Run blocking AWS calls in a thread
+                        await asyncio.to_thread(
+                            remove_inbound_security_rule, 
+                            port=rule["remotePort"]
+                        )
+                        print(f"[DELETE {username}] Removed AWS rule for port {rule['remotePort']}")
+                
+                if proxy_names_to_delete:
+                    # Use the helper function in a thread
+                    await asyncio.to_thread(
+                        _remove_proxies_from_config, 
+                        proxy_names_to_delete
+                    )
+                    print(f"[DELETE {username}] Removed proxies from frpc.toml")
+
+                del registry[username]
+                await asyncio.to_thread(save_vm_registry, registry)
+                print(f"[DELETE {username}] Removed VM from registry.")
+            
+        # --- Lock is released here ---
+        
+        if proxy_names_to_delete:
+            # Reload frpc *after* lock is released
+            print(f"[DELETE {username}] Reloading frpc configuration...")
+            await asyncio.to_thread(execute_frpc_reload)
+
+        print(f"[DELETE {username}] Cleanup complete.")
+    except Exception as e:
+        print(f"[ERROR] Failed to delete VM {username} in background: {e}")
+
 def load_vm_registry():
     if not REGISTRY_FILE.exists():
         return {}
@@ -346,6 +427,38 @@ def remove_inbound_security_rule(port: int):
 
 
 #region --- FRPC Process Management Functions ---
+def _append_proxies_to_config(proxy_toml_list: List[str]):
+    """
+    Appends a list of proxy definitions to the frpc.toml file.
+    This is a blocking function intended to be run in a thread.
+    """
+    with open(FRP_CONFIG_PATH, "a") as f:
+        for proxy_toml in proxy_toml_list:
+            f.write(proxy_toml)
+
+def _remove_proxies_from_config(proxy_names_to_delete: Set[str]):
+    """
+    Removes proxy sections from frpc.toml by name.
+    This is a blocking function intended to be run in a thread.
+    """
+    with open(FRP_CONFIG_PATH, "r") as f:
+        content = f.read()
+    
+    parts = content.split("\n[[proxies]]\n")
+    server_config = parts[0]
+    proxy_blocks = parts[1:]
+
+    kept_blocks = []
+    for block in proxy_blocks:
+        if not any(f'name = "{name}"' in block for name in proxy_names_to_delete):
+            kept_blocks.append(block)
+
+    new_content = server_config
+    if kept_blocks:
+        new_content += "\n[[proxies]]\n" + "\n[[proxies]]\n".join(kept_blocks)
+    
+    with open(FRP_CONFIG_PATH, "w") as f:
+        f.write(new_content)
 def start_frpc():
     global frpc_process
     if frpc_process and psutil.pid_exists(frpc_process.pid):
@@ -418,35 +531,44 @@ async def list_vms():
     """Returns the current VM registry."""
     registry = load_vm_registry()
     return registry
-
-
 @app.post('/add-inbound-rule/{port}')
 async def add_inbound_rule(port: int, body: AddRuleBody, background_tasks: BackgroundTasks):
     if port < 1 or port > 65535:
         raise HTTPException(status_code=400, detail="Port must be between 1 and 65535.")
 
-    registry = load_vm_registry()
-    # Use body.username instead of username
-    vm = registry.get(body.username)
+    new_proxy_toml = ""
     
-    if not vm:
-        # Use body.username instead of username
-        raise HTTPException(status_code=404, detail=f"VM '{body.username}' not found in registry.")
-    
-    remotePort = find_available_remotePort()
-    for rule in vm.get("inbound_rules", []):
-        if rule.get("vm_port") == port:
-            # Use body.username instead of username
-            return {"message": f"Inbound rule for port {port} already exists for VM '{body.username}'."}
-            
-    vm["inbound_rules"].append({"type": "tcp", "vm_port": port, "description": body.description, "remotePort": remotePort})
-    save_vm_registry(registry)
-    # Use body.description instead of description
-    success = add_inbound_security_rule(remotePort, description=body.description)
-    
-    # Use body.username instead of username
-    proxy_name = f"{body.username}-{port}"
-    new_proxy_toml = f"""
+    # --- FIX: Acquire lock to modify shared state ---
+    async with REGISTRY_LOCK:
+        registry = await asyncio.to_thread(load_vm_registry)
+        vm = registry.get(body.username)
+        
+        if not vm:
+            raise HTTPException(status_code=404, detail=f"VM '{body.username}' not found in registry.")
+        
+        remotePort = await asyncio.to_thread(find_available_remotePort)
+        
+        for rule in vm.get("inbound_rules", []):
+            if rule.get("vm_port") == port:
+                return {"message": f"Inbound rule for port {port} already exists for VM '{body.username}'."}
+                
+        vm["inbound_rules"].append({"type": "tcp", "vm_port": port, "description": body.description, "remotePort": remotePort})
+        
+        await asyncio.to_thread(save_vm_registry, registry)
+        
+        success = await asyncio.to_thread(
+            add_inbound_security_rule,
+            remotePort,
+            description=body.description
+        )
+        
+        if not success:
+            # Note: This leaves the registry in a slightly inconsistent state.
+            # A full rollback would be more complex.
+            raise HTTPException(status_code=500, detail=f"Failed to add AWS security rule for port {port}.")
+
+        proxy_name = f"{body.username}-{port}"
+        new_proxy_toml = f"""
 [[proxies]]
 name = "{proxy_name}"
 type = "tcp"
@@ -454,91 +576,65 @@ localIP = "{vm['private_ip']}"
 localPort = {port}
 remotePort = {remotePort}
 """
-
-    with open(FRP_CONFIG_PATH, "a") as f:
-        f.write(new_proxy_toml)
-        # Use body.username instead of username
+        # Use the helper function in a thread
+        await asyncio.to_thread(_append_proxies_to_config, [new_proxy_toml])
         print(f"Appended proxy for '{body.username}' to frpc.toml")
+
+    # --- Lock is released here ---
+    
     reload_frpc_background(background_tasks)
     
-    if not success:
-        raise HTTPException(status_code=500, detail=f"Failed to add inbound rule for port {port}.")
     return {"message": f"Inbound rule for port {port} added successfully."}
 
 # Add this endpoint to your FastAPI python file
-
 @app.delete("/remove-inbound-rule/{username}/{remote_port}")
 async def remove_inbound_rule(username: str, remote_port: int, background_tasks: BackgroundTasks):
-    registry = load_vm_registry()
     
-    # 1. Find the VM in the registry
-    if username not in registry:
-        raise HTTPException(status_code=404, detail=f"VM '{username}' not found.")
-    
-    vm_data = registry[username]
-    
-    # 2. Find the specific rule to remove by its remote_port
-    rule_to_remove = None
-    for rule in vm_data.get("inbound_rules", []):
-        if rule.get("remotePort") == remote_port:
-            rule_to_remove = rule
-            break
+    # --- FIX: Acquire lock to modify shared state ---
+    async with REGISTRY_LOCK:
+        registry = await asyncio.to_thread(load_vm_registry)
+        
+        if username not in registry:
+            raise HTTPException(status_code=404, detail=f"VM '{username}' not found.")
+        
+        vm_data = registry[username]
+        
+        rule_to_remove = None
+        for rule in vm_data.get("inbound_rules", []):
+            if rule.get("remotePort") == remote_port:
+                rule_to_remove = rule
+                break
 
-    if not rule_to_remove:
-        raise HTTPException(status_code=404, detail=f"Rule with public port {remote_port} not found for VM '{username}'.")
+        if not rule_to_remove:
+            raise HTTPException(status_code=404, detail=f"Rule with public port {remote_port} not found for VM '{username}'.")
 
-    # 3. Clean up resources associated with the rule
-    # ... inside the remove_inbound_rule function ...
-# ...
-    try:
-        # a. Remove the rule from the AWS security group
-        remove_inbound_security_rule(port=remote_port)
-        
-        # --- START OF REPLACED BLOCK ---
-        
-        # b. Remove the proxy from the frpc.toml file by processing it in blocks
-        vm_port = rule_to_remove["vm_port"]
-        proxy_name_to_delete = f"{username}-{vm_port}"
-        
-        with open(FRP_CONFIG_PATH, "r") as f:
-            content = f.read()
-        
-        # The first part is the server config, the rest are proxy blocks
-        parts = content.split("\n[[proxies]]\n")
-        server_config = parts[0]
-        proxy_blocks = parts[1:]
-
-        # Keep only the proxy blocks that we don't want to delete
-        kept_blocks = []
-        for block in proxy_blocks:
-            # Check if this block's name is in our deletion set
-            if not f'name = "{proxy_name_to_delete}"' in block:
-                kept_blocks.append(block)
-
-        # Rebuild the file content
-        new_content = server_config
-        if kept_blocks:
-            # Add the [[proxies]] delimiter back for each kept block
-            new_content += "\n[[proxies]]\n" + "\n[[proxies]]\n".join(kept_blocks)
-        
-        # Write the new content back to the file
-        with open(FRP_CONFIG_PATH, "w") as f:
-            f.write(new_content)
+        try:
+            # a. Remove from AWS (blocking)
+            await asyncio.to_thread(remove_inbound_security_rule, port=remote_port)
             
-        # --- END OF REPLACED BLOCK ---
+            # b. Remove from frpc.toml (blocking)
+            vm_port = rule_to_remove["vm_port"]
+            proxy_name_to_delete = f"{username}-{vm_port}"
+            await asyncio.to_thread(
+                _remove_proxies_from_config, 
+                {proxy_name_to_delete}
+            )
 
-        # c. Remove the rule from the registry object
-        vm_data["inbound_rules"].remove(rule_to_remove)
-        save_vm_registry(registry)
-        
-        # d. Reload the frpc service to apply changes
-        reload_frpc_background(background_tasks)
+            # c. Remove from registry (blocking)
+            vm_data["inbound_rules"].remove(rule_to_remove)
+            await asyncio.to_thread(save_vm_registry, registry)
+            
+        except Exception as e:
+            # If any step fails, we've left the system in an inconsistent state.
+            # Report the error. A full rollback is complex.
+            raise HTTPException(status_code=500, detail=f"An error occurred while removing the rule: {str(e)}")
+    
+    # --- Lock is released here ---
 
-        return {"message": f"Successfully removed rule for public port {remote_port}."}
-        
-    except Exception as e:
-        # If anything goes wrong, we should ideally roll back, but for now, we'll report the error.
-        raise HTTPException(status_code=500, detail=f"An error occurred while removing the rule: {str(e)}")
+    # d. Reload frpc via background task
+    reload_frpc_background(background_tasks)
+
+    return {"message": f"Successfully removed rule for public port {remote_port}."}
 
 
 
@@ -553,24 +649,40 @@ async def create_vm(vm: VirtualMachine, background_tasks: BackgroundTasks):
         if not (SSH_DIR / f"{vm.key_name}.pub").exists():
             raise HTTPException(status_code=400, detail=f"SSH key '{vm.key_name}' does not exist. Generate it first.")
 
-        private_ip = find_ip()
-        registry = load_vm_registry()
-        
-        vm_data = vm.model_dump()
-        vm_data["private_ip"] = private_ip
-        
-        proxies_to_add = []
-        ## FIXED ## --- Logic to assign unique ports within the same request ---
-        ports_assigned_in_this_request = set()
-        for rule in vm_data["inbound_rules"]:
-            remotePort = find_available_remotePort(exclude_ports=ports_assigned_in_this_request)
-            add_inbound_security_rule(remotePort, f"Tunnel for {vm.username} on port {remotePort}")
-            ports_assigned_in_this_request.add(remotePort)
-            rule["remotePort"] = remotePort
-            proxy_name = f"{vm.username}-{rule['vm_port']}"
+        # --- FIX: Acquire lock before touching shared state ---
+        async with REGISTRY_LOCK:
+            # All blocking calls inside the lock must use to_thread
+            private_ip = await asyncio.to_thread(find_ip)
+            registry = await asyncio.to_thread(load_vm_registry)
             
-            ## FIXED ## --- Changed remotePort to remotePort ---
-            new_proxy_toml = f"""
+            # Check for username collision again *inside* the lock
+            if vm.username in registry:
+                 raise HTTPException(status_code=400, detail=f"VM '{vm.username}' already exists.")
+
+            vm_data = vm.model_dump()
+            vm_data["private_ip"] = private_ip
+            
+            proxies_to_add = []
+            ports_assigned_in_this_request = set()
+            
+            for rule in vm_data["inbound_rules"]:
+                remotePort = await asyncio.to_thread(
+                    find_available_remotePort, 
+                    exclude_ports=ports_assigned_in_this_request
+                )
+                
+                # Also wrap the AWS call
+                await asyncio.to_thread(
+                    add_inbound_security_rule,
+                    remotePort,
+                    f"Tunnel for {vm.username} on port {remotePort}"
+                )
+                
+                ports_assigned_in_this_request.add(remotePort)
+                rule["remotePort"] = remotePort
+                proxy_name = f"{vm.username}-{rule['vm_port']}"
+                
+                new_proxy_toml = f"""
 [[proxies]]
 name = "{proxy_name}"
 type = "tcp"
@@ -578,16 +690,19 @@ localIP = "{private_ip}"
 localPort = {rule['vm_port']}
 remotePort = {remotePort}
 """
-            proxies_to_add.append(new_proxy_toml)
+                proxies_to_add.append(new_proxy_toml)
+            
+            registry[vm.username] = vm_data
+            await asyncio.to_thread(save_vm_registry, registry)
+
+            # Use the helper function
+            await asyncio.to_thread(_append_proxies_to_config, proxies_to_add)
+            
+            print(f"Appended {len(proxies_to_add)} proxies for '{vm.username}' to frpc.toml")
         
-        registry[vm.username] = vm_data
-        save_vm_registry(registry)
+        # --- Lock is released here ---
 
-        with open(FRP_CONFIG_PATH, "a") as f:
-            for proxy_toml in proxies_to_add:
-                f.write(proxy_toml)
-        print(f"Appended {len(proxies_to_add)} proxies for '{vm.username}' to frpc.toml")
-
+        # Vagrantfile creation is not shared, so it's fine outside the lock
         vm_path.mkdir(exist_ok=True)
         vagrantfile_content = get_vagrantfile_content(vm, private_ip)
         with open(vm_path / "Vagrantfile", "w") as f:
@@ -596,115 +711,73 @@ remotePort = {remotePort}
         background_tasks.add_task(stream_vagrant_up, str(vm_path))
         reload_frpc_background(background_tasks)
 
-        return {"message": f"You will now be able to SSH into your Nimbus-VM using ssh -i {vm.key_name} {vm.username}@13.233.204.203 -p {registry[vm.username]['inbound_rules'][0]['remotePort']}"}
+        ssh_port = registry[vm.username]['inbound_rules'][0]['remotePort']
+        return {"message": f"You will now be able to SSH into your Nimbus-VM using ssh -i {vm.key_name} {vm.username}@13.233.204.203 -p {ssh_port}"}
 
     except Exception as e:
-        registry = load_vm_registry()
-        if vm.username in registry:
-            del registry[vm.username]
-            save_vm_registry(registry)
+        # --- FIX: Async Rollback ---
+        # Try to roll back the registry entry if creation failed
+        print(f"Error during VM creation: {e}. Attempting rollback...")
+        try:
+            async with REGISTRY_LOCK:
+                registry = await asyncio.to_thread(load_vm_registry)
+                if vm.username in registry:
+                    del registry[vm.username]
+                    await asyncio.to_thread(save_vm_registry, registry)
+                    print(f"Successfully rolled back registry entry for {vm.username}.")
+        except Exception as rollback_e:
+            print(f"CRITICAL: Failed to roll back registry for {vm.username}. Registry may be inconsistent. Rollback error: {rollback_e}")
+
+        # Note: This simplified rollback doesn't undo AWS rules or frpc.toml changes.
         raise HTTPException(status_code=500, detail=str(e))
 
 #endregion
 
 
+
 #region --- Delete VM Endpoint ---
 @app.delete("/delete-vm/{username}")
 async def delete_vm(username: str, background_tasks: BackgroundTasks):
-    try:
-        vm_path = VMS_DIR / username
-        if not vm_path.exists():
+    vm_path = VMS_DIR / username
+    if not vm_path.exists():
+        # Also check registry, in case dir is gone but entry isn't
+        registry = load_vm_registry() # This is blocking! See Part 2
+        if username not in registry:
             raise HTTPException(status_code=404, detail=f"VM '{username}' does not exist.")
-
-        destroy_proc = subprocess.run(["vagrant", "destroy", "-f"], cwd=vm_path, capture_output=True, text=True)
-        if destroy_proc.returncode != 0:
-            print(f"Warning: Vagrant destroy failed for {username}, but proceeding with cleanup. Error: {destroy_proc.stderr.strip()}")
-
-        rmtree(vm_path)
-        
-        registry = load_vm_registry()
-        if username in registry:
-            vm_to_delete = registry[username]
-            proxy_names_to_delete = {f"{username}-{rule['vm_port']}" for rule in vm_to_delete.get("inbound_rules", [])}
-            
-            for rule in vm_to_delete.get("inbound_rules", []):
-                if "remotePort" in rule:
-                    remove_inbound_security_rule(port=rule["remotePort"])
-                    print(f"Removed AWS security group rule for port {rule['remotePort']}")
-            
-            if proxy_names_to_delete:
-                with open(FRP_CONFIG_PATH, "r") as f:
-                    content = f.read()
-                
-                # The first part is the server config, the rest are proxy blocks
-                parts = content.split("\n[[proxies]]\n")
-                server_config = parts[0]
-                proxy_blocks = parts[1:]
-
-                # Keep only the proxy blocks that we don't want to delete
-                kept_blocks = []
-                for block in proxy_blocks:
-                    # Check if this block's name is in our deletion set
-                    # We construct the full 'name = "..."' string for a precise match
-                    if not any(f'name = "{name}"' in block for name in proxy_names_to_delete):
-                        kept_blocks.append(block)
-
-                # Rebuild the file content
-                new_content = server_config
-                if kept_blocks:
-                    # Add the [[proxies]] delimiter back for each kept block
-                    new_content += "\n[[proxies]]\n" + "\n[[proxies]]\n".join(kept_blocks)
-                
-                # Write the new content back to the file
-                with open(FRP_CONFIG_PATH, "w") as f:
-                    f.write(new_content)
-                # --- End of replaced block ---
-
-                print(f"Removed proxies for '{username}' from frpc.toml")
-                reload_frpc_background(background_tasks)
-
-            del registry[username]
-            save_vm_registry(registry)
-
-        return {"message": f"VM '{username}' destroyed and directory/tunnels removed successfully."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    
+    background_tasks.add_task(delete_vm_background, username)
+    return {"message": f"VM '{username}' delete process has been scheduled."}
 
 #endregion
 
 
 #region --- Start VM Endpoints ---
 @app.post("/start-vm/{username}")
-async def start_vm(username: str):
+async def start_vm(username: str, background_tasks: BackgroundTasks): # Add BackgroundTasks
     try:
         vm_path = VMS_DIR / username
         print(vm_path)
         if not vm_path.exists():
             raise HTTPException(status_code=404, detail=f"VM '{username}' does not exist.")
-        start_proc = subprocess.run(["vagrant", "up"], cwd=vm_path, capture_output=True, text=True)
-        if start_proc.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"VM booting failed: {start_proc.stderr.strip()}")
-        return {"message": f"VM '{username}' booted successfully."}
+        background_tasks.add_task(stream_vagrant_up, str(vm_path))
+        
+        return {"message": f"VM '{username}' is booting..."} # Return immediately
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 #endregion
 
 
 #region --- Stop VM Endpoints ---
-
 @app.post("/stop-vm/{username}")
-async def stop_vm(username: str):
+async def stop_vm(username: str, background_tasks: BackgroundTasks): # Add BackgroundTasks
     try:
         vm_path = VMS_DIR / username
         if not vm_path.exists():
             raise HTTPException(status_code=404, detail=f"VM '{username}' does not exist.")
-        stop_proc = subprocess.run(["vagrant", "halt"], cwd=vm_path, capture_output=True, text=True)
-        if stop_proc.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"Vagrant halt failed: {stop_proc.stderr.strip()}")
-        return {"message": f"VM '{username}' Stopped successfully."}
+        background_tasks.add_task(stream_vagrant_halt, str(vm_path))
+        return {"message": f"VM '{username}' is stopping."} # Return immediately
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 #endregion
 
 #endregion
