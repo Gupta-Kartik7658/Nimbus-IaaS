@@ -10,3 +10,4 @@ __pycache__
 frp_0.59.0_windows_amd64
 *.db
 *.env
+.env
