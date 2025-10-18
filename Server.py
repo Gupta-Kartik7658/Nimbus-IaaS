@@ -1,6 +1,7 @@
 # region -----------Imports-------
 import os
 import time
+from dotenv import load_dotenv
 import json
 from sqlalchemy import select  # <-- ADD THIS IMPORT
 import subprocess
@@ -35,6 +36,7 @@ from crud import (
  
 # endregion
 
+load_dotenv()
 
 
 #region -------------Directory and File Paths--------
@@ -362,7 +364,7 @@ def find_port_from_set(all_used_ports: set[int], start=2222, end=3000):
 
 #region --- AWS Security Group Management ---
 EC2_CLIENT = boto3.client("ec2", region_name="ap-south-1") # Use your region
-SECURITY_GROUP_ID = "sg-0b0cb6352cf1c28be" # <-- IMPORTANT: Replace with your actual Security Group ID
+SECURITY_GROUP_ID = os.environ.get("SECURITY_GROUP_ID")
 
 def add_inbound_security_rule(port: int, description: str):
     """Adds an inbound rule to the AWS Security Group."""
