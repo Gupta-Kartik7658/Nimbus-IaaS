@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # --- NEW IMPORTS ---
+from auth import UserRead, UserCreate  
 from database import get_async_db, engine, async_session_factory
 from models import Base, User, VM
 from auth import auth_backend, fastapi_users, current_active_user
@@ -30,7 +31,7 @@ from crud import (
     get_all_used_ips,
     get_all_used_ports,
 )
-from fastapi_users.schemas import UserRead, UserCreate
+
  
 # endregion
 
