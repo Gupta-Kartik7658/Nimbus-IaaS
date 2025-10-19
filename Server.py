@@ -33,7 +33,8 @@ from crud import (
     get_all_used_ports,
     get_user_key_by_name, 
     get_keys_for_user, 
-    create_ssh_key
+    create_ssh_key,
+    is_key_in_use
 )
 from cryptography.hazmat.primitives import serialization as crypto_serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -210,6 +211,37 @@ async def list_keys(
     """Lists the names of all SSH keys for the logged-in user."""
     keys = await get_keys_for_user(db, current_user.id)
     return [{"name": key.name} for key in keys]
+
+@app.delete("/delete-key/{key_name}")
+async def delete_key(
+    key_name: str,
+    current_user: User = Depends(current_active_user),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """Deletes an SSH key, only if it is not in use by any VMs."""
+    
+    # 1. Find the key and verify ownership
+    key_to_delete = await get_user_key_by_name(db, key_name, current_user.id)
+    if not key_to_delete:
+        raise HTTPException(status_code=404, detail=f"Key '{key_name}' not found.")
+
+    # 2. CRITICAL: Check if the key is still in use
+    if await is_key_in_use(db, key_name, current_user.id):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Key '{key_name}' is still in use by one or more VMs. Delete those VMs first."
+        )
+
+    # 3. Delete the key
+    try:
+        await db.delete(key_to_delete)
+        await db.commit()
+        return {"message": f"Successfully deleted key '{key_name}'."}
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to delete key: {str(e)}")
+
+
 
 #endregion
 
