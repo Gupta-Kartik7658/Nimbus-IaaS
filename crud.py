@@ -7,6 +7,8 @@ async def get_vm_by_name(db: AsyncSession, vm_name: str) -> VM | None:
     result = await db.execute(select(VM).where(VM.name == vm_name))
     return result.scalars().first()
 
+
+
 async def get_user_vm_by_name(db: AsyncSession, vm_name: str, user_id: str) -> VM | None:
     """Fetches a single VM by name, ONLY if it belongs to the specified user."""
     result = await db.execute(
@@ -65,3 +67,14 @@ async def create_ssh_key(db: AsyncSession, name: str, public_key: str, private_k
     await db.commit()
     await db.refresh(new_key)
     return new_key
+
+async def is_key_in_use(db: AsyncSession, key_name: str, user_id: str) -> bool:
+    """Checks if any VMs for the user are still using this key."""
+    result = await db.execute(
+        select(VM).where(
+            VM.key_name == key_name,
+            VM.owner_id == user_id
+        )
+    )
+    # .first() is efficient. It stops searching after finding one match.
+    return result.scalars().first() is not None
