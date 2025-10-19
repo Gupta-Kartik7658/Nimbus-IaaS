@@ -3,17 +3,17 @@ import os
 import time
 from dotenv import load_dotenv
 import json
-from sqlalchemy import select  # <-- ADD THIS IMPORT
+from sqlalchemy import select 
 import subprocess
 from pathlib import Path
 from shutil import rmtree
 from typing import List, Set, Literal, Optional
 from contextlib import asynccontextmanager
 import asyncio
-from asyncio import Lock  # <-- IMPORTANT
+from asyncio import Lock  
 import psutil
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 import boto3
 from botocore.exceptions import ClientError
@@ -31,25 +31,30 @@ from crud import (
     get_vms_for_user,
     get_all_used_ips,
     get_all_used_ports,
+    get_user_key_by_name, 
+    get_keys_for_user, 
+    create_ssh_key
 )
+from cryptography.hazmat.primitives import serialization as crypto_serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.backends import default_backend as crypto_default_backend
 
  
 # endregion
 
-load_dotenv()
+
 
 
 #region -------------Directory and File Paths--------
 BASE_DIR = Path(__file__).parent
 VMS_DIR = BASE_DIR / ".vms"
-SSH_DIR = BASE_DIR / ".ssh"
-
 
 FRP_DIR = BASE_DIR / "frp_0.59.0_windows_amd64"  # Adjust this path as needed
 FRP_EXECUTABLE_PATH = FRP_DIR / "frpc.exe" # Or "frpc" on Linux/macOS
 FRP_CONFIG_PATH = FRP_DIR / "frpc.toml"
 frpc_process = None 
 RESOURCE_LOCK = asyncio.Lock()  # <-- NEW: Lock for resource allocation
+load_dotenv()
 #endregion
 
 
@@ -134,73 +139,101 @@ class VirtualMachine(BaseModel):
     
     
 #region --- SSH Key Management ---
+
 @app.post("/generate-key/{key_name}")
-def generate_key(key_name: str):
+async def generate_key(
+    key_name: str,
+    current_user: User = Depends(current_active_user),
+    db: AsyncSession = Depends(get_async_db)
+):
+    if not key_name.isalnum() or " " in key_name:
+        raise HTTPException(status_code=400, detail="Key name must be alphanumeric and contain no spaces.")
+
+    # Check for duplicate key name for THIS user in the DB
+    existing_key = await get_user_key_by_name(db, key_name, current_user.id)
+    if existing_key:
+        raise HTTPException(status_code=400, detail=f"Key with name '{key_name}' already exists.")
+
     try:
-        if not key_name.isalnum() or " " in key_name:
-            raise HTTPException(status_code=400, detail="Key name must be alphanumeric and contain no spaces.")
+        # Generate private key in memory
+        key = rsa.generate_private_key(
+            backend=crypto_default_backend(),
+            public_exponent=65537,
+            key_size=2048
+        )
+        private_key = key.private_bytes(
+            crypto_serialization.Encoding.PEM,
+            crypto_serialization.PrivateFormat.PKCS8,
+            crypto_serialization.NoEncryption()
+        )
+        public_key = key.public_key().public_bytes(
+            crypto_serialization.Encoding.OpenSSH,
+            crypto_serialization.PublicFormat.OpenSSH
+        )
 
-        SSH_DIR.mkdir(exist_ok=True)
-        private_key_path = SSH_DIR / key_name
+        # Decode from bytes to string for DB storage
+        private_key_str = private_key.decode('utf-8')
+        public_key_str = public_key.decode('utf-8')
 
-        if private_key_path.exists():
-            raise HTTPException(status_code=400, detail=f"Key '{key_name}' already exists.")
+        # Save to database
+        await create_ssh_key(db, key_name, public_key_str, private_key_str, current_user.id)
 
-        command = ["ssh-keygen", "-t", "rsa", "-b", "2048", "-f", str(private_key_path), "-N", "", "-C", key_name]
-
-        subprocess.run(command, check=True, capture_output=True, text=True)
-        private_key_path.chmod(0o600)
-
-        return {"message": f"SSH key '{key_name}' generated successfully.", "download_path": f"/download/{key_name}"}
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"SSH keygen failed: {e.stderr.strip()}")
+        return {"message": f"SSH key '{key_name}' generated and saved successfully."}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Failed to generate key: {str(e)}")
 
-@app.get("/download/{key_name}")
-async def download_key(key_name: str):
-    private_key_path = SSH_DIR / key_name
-    if not private_key_path.exists():
-        raise HTTPException(status_code=404, detail=f"Key '{key_name}' does not exist.")
-    return FileResponse(path=private_key_path, filename=key_name, media_type='application/octet-stream')
 
-@app.get("/list-keys/")
-async def download_key():
-    keys = []
-    for i in SSH_DIR.glob("*"):
-        if(i.suffix == ".pub"):
-            keys.append(i.name)
-    return keys
+@app.get("/download-key/{key_name}")
+async def download_key(
+    key_name: str,
+    current_user: User = Depends(current_active_user),
+    db: AsyncSession = Depends(get_async_db)
+):
+    # Fetch the key from the DB, ensuring it belongs to the user
+    key = await get_user_key_by_name(db, key_name, current_user.id)
+    if not key:
+        raise HTTPException(status_code=404, detail=f"Key '{key_name}' not found.")
+    
+    # Serve the private key string directly as a downloadable file
+    return Response(
+        content=key.private_key,
+        media_type='application/octet-stream',
+        headers={"Content-Disposition": f"attachment; filename={key_name}"}
+    )
+
+
+@app.get("/list-keys")
+async def list_keys(
+    current_user: User = Depends(current_active_user),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """Lists the names of all SSH keys for the logged-in user."""
+    keys = await get_keys_for_user(db, current_user.id)
+    return [{"name": key.name} for key in keys]
 
 #endregion
 
 
 
 #region --- Vagrantfile Generation ---
-def get_vagrantfile_content(vm: VirtualMachine, private_ip: str) -> str:
-    pub_key_path = SSH_DIR / f"{vm.key_name}.pub"
-    if not pub_key_path.exists():
-        raise FileNotFoundError(f"Public key file not found: {pub_key_path}")
-
-    # This ensures the path is correctly formatted for Vagrant
-    pub_key_path_str = str(pub_key_path).replace("\\", "/")
-
+def get_vagrantfile_content(vm: VirtualMachine, private_ip: str, public_key_str: str) -> str:
     # --- Prepare the custom provisioning script to be injected ---
     custom_script_injection = ""
     if vm.provisioning_script:
+        # Note: We must escape backticks and dollar signs in the user's script
+        # to prevent them from being interpreted by the outer shell script.
+        escaped_script = vm.provisioning_script.replace("`", "\\`").replace("$", "\\$")
         custom_script_injection = f"""
     echo "--- Running Custom User Provisioning Script ---"
-    # Run the custom script as the new user for better isolation and security
     sudo -i -u {vm.username} bash <<'EOF'
-{vm.provisioning_script}
+{escaped_script}
 EOF
     echo "--- Custom Script Finished ---"
 """
 
+    # The f-string for the Vagrantfile
     return f"""
 Vagrant.configure("2") do |config|
-    NEW_USERNAME = "{vm.username}"
-
     config.vm.box = "{vm.image}"
     config.vm.network "private_network", ip: "{private_ip}"
     config.vm.hostname = "{vm.username}"
@@ -212,15 +245,13 @@ Vagrant.configure("2") do |config|
 
     config.ssh.insert_key = false
 
-    config.vm.provision "file", source: "{pub_key_path_str}", destination: "/tmp/user_public_key.pub"
-
-    # --- THIS IS THE CORRECTED BLOCK ---
+    # Inject the public key directly into the shell script
     config.vm.provision "shell", privileged: true, inline: <<-SHELL
-        set -x # Enable debugging output
+        set -x 
 
         NEW_USERNAME="{vm.username}"
         echo "Provisioning VM with user '$NEW_USERNAME'..."
-
+        
         # 1. Create the user
         useradd --create-home --shell /bin/bash "$NEW_USERNAME"
 
@@ -239,19 +270,23 @@ Vagrant.configure("2") do |config|
 
         # 3. Setup SSH key for the new user
         mkdir -p /home/$NEW_USERNAME/.ssh
-        cat /tmp/user_public_key.pub > /home/$NEW_USERNAME/.ssh/authorized_keys
+        # --- THIS IS THE FIX ---
+        # We echo the public key string (passed as an argument)
+        # into the authorized_keys file.
+        echo '{public_key_str}' > /home/$NEW_USERNAME/.ssh/authorized_keys
+        # --- END FIX ---
         chown -R $NEW_USERNAME:$NEW_USERNAME /home/$NEW_USERNAME/.ssh
         chmod 700 /home/$NEW_USERNAME/.ssh
         chmod 600 /home/$NEW_USERNAME/.ssh/authorized_keys
 
-        # 4. Restart SSH daemon (AFTER provisioning)
+        # 4. Restart SSH daemon
         systemctl restart sshd || systemctl restart ssh
 
         echo "--- Base Provisioning Complete ---"
 
         # 5. Inject and run the custom user script
         {custom_script_injection}
-    SHELL
+SHELL
 end
 """
 #endregion
@@ -643,8 +678,8 @@ async def remove_inbound_rule(
 
 
 
+
 #region --- Create VM Endpoint ---
-# --- MODIFIED: /create-vm ---
 @app.post("/create-vm")
 async def create_vm(
     vm: VirtualMachine, 
@@ -656,8 +691,13 @@ async def create_vm(
         vm_path = VMS_DIR / vm.username # vm.username is the 'vm_name'
         if vm_path.exists():
             raise HTTPException(status_code=400, detail=f"VM '{vm.username}' directory already exists.")
-        if not (SSH_DIR / f"{vm.key_name}.pub").exists():
-            raise HTTPException(status_code=400, detail=f"SSH key '{vm.key_name}' does not exist.")
+      
+        ssh_key = await get_user_key_by_name(db, vm.key_name, current_user.id)
+        if not ssh_key:
+            raise HTTPException(status_code=400, detail=f"SSH key '{vm.key_name}' not found or you do not have permission to use it.")
+        #
+        # --- END OF FIX ---
+        #
 
         async with RESOURCE_LOCK:
             # Check if VM name is taken in DB
@@ -707,20 +747,23 @@ remotePort = {remotePort}
                 image=vm.image,
                 private_ip=private_ip,
                 inbound_rules=vm_rules_list,
-                owner_id=current_user.id  # CRITICAL: Link to user
+                owner_id=current_user.id
             )
             db.add(new_vm_record)
-            await db.commit()
             
             # Write all proxies to frpc.toml
+            # Use the non-blocking helper
             await asyncio.to_thread(_append_proxies_to_config, proxies_to_add)
             
-            await db.refresh(new_vm_record) # Get the new VM's ID, etc.
+            # Commit DB changes *after* other blocking I/O
+            await db.commit()
+            await db.refresh(new_vm_record)
 
         # --- Lock is released here ---
         
         vm_path.mkdir(exist_ok=True)
-        vagrantfile_content = get_vagrantfile_content(vm, private_ip)
+        # Pass the public key string (from the db) to the function
+        vagrantfile_content = get_vagrantfile_content(vm, private_ip, ssh_key.public_key)
         with open(vm_path / "Vagrantfile", "w") as f:
             f.write(vagrantfile_content)
 
@@ -731,9 +774,9 @@ remotePort = {remotePort}
         return {"message": f"ssh -i {vm.key_name} {vm.username}@13.233.204.203 -p {ssh_port}"}
 
     except Exception as e:
-        # DB changes will be rolled back by the 'Depends(get_async_db)' context
+        await db.rollback() # Rollback in case of error
         raise HTTPException(status_code=500, detail=str(e))
-# endregion
+#endregion
 
 
 
