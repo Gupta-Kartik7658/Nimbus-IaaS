@@ -327,6 +327,29 @@ end
 
 
 #region --- Vagrant and VM Management ---
+async def background_provision_vm(vm_id: int, vm_path: str):
+    async with async_session_factory() as db:
+        try:
+            # Run vagrant up in a thread (non-blocking)
+            await asyncio.to_thread(stream_vagrant_up, vm_path)
+            
+            result = await db.execute(select(VM).where(VM.id == vm_id))
+            vm_obj = result.scalars().first()
+            if vm_obj:
+                vm_obj.status = "Active"
+                db.add(vm_obj)
+                await db.commit()
+
+        except Exception as e:
+            result = await db.execute(select(VM).where(VM.id == vm_id))
+            vm_obj = result.scalars().first()
+            if vm_obj:
+                vm_obj.status = "Error"
+                await db.commit()
+            print(f"[ERROR] VM provisioning failed for {vm_id}: {e}")
+            
+
+            
 def stream_vagrant_up(vm_path: str):
     try:
         process = subprocess.Popen(["vagrant", "up"], cwd=vm_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -336,6 +359,31 @@ def stream_vagrant_up(vm_path: str):
         print(f"[INFO] Vagrant exited with code: {process.returncode}")
     except Exception as e:
         print(f"[ERROR] Exception during Vagrant up: {e}")
+        
+async def background_stop_vm(vm_id: int, vm_path: str):
+    async with async_session_factory() as db:
+        result = await db.execute(select(VM).where(VM.id == vm_id))
+        vm_obj = result.scalars().first()
+        if vm_obj:
+            vm_obj.status = "Stopping"
+            await db.commit()
+        
+        try:
+            await asyncio.to_thread(stream_vagrant_halt, vm_path)
+
+            result = await db.execute(select(VM).where(VM.id == vm_id))
+            vm_obj = result.scalars().first()
+            if vm_obj:
+                vm_obj.status = "Stopped"
+                await db.commit()
+            
+        except Exception as e:
+            result = await db.execute(select(VM).where(VM.id == vm_id))
+            vm_obj = result.scalars().first()
+            if vm_obj:
+                vm_obj.status = "Error"
+                await db.commit()
+            print(f"[ERROR] VM Halting failed for {vm_id}: {e}")
 
 def stream_vagrant_halt(vm_path: str):
     try:
@@ -355,16 +403,20 @@ async def delete_vm_background(vm_id: int):
     Fully self-contained background task to delete a VM and all its resources.
     It creates its own database session.
     """
+    
     print(f"[BG Task] Starting deletion for VM ID: {vm_id}")
     async with async_session_factory() as db:
-        try:
+        try:     
             # 1. Fetch the VM from the DB
             # --- (Your DB fetch logic is correct) ---
             result = await db.execute(select(VM).where(VM.id == vm_id)) # You were missing 'select'
             vm_to_delete = result.scalars().first()
             
-            if not vm_to_delete:
-                # ... (your log is correct) ...
+            if vm_to_delete:
+                vm_to_delete.status = "Deleting"
+                await db.commit()
+            else:
+                print(f"[BG Task] VM ID {vm_id} not found in DB.")
                 return
 
             vm_name = vm_to_delete.name
@@ -549,10 +601,7 @@ def stop_frpc():
     print("frpc stopped.")
     frpc_process = None
 
-# def reload_frpc_background(background_tasks: BackgroundTasks):
-#     background_tasks.add_task(stop_frpc)
-#     background_tasks.add_task(time.sleep, 1)
-#     background_tasks.add_task(start_frpc)
+
     
     
 def execute_frpc_reload():
@@ -780,7 +829,8 @@ remotePort = {remotePort}
                 image=vm.image,
                 private_ip=private_ip,
                 inbound_rules=vm_rules_list,
-                owner_id=current_user.id
+                owner_id=current_user.id,
+                status="Provisioning"
             )
             db.add(new_vm_record)
             
@@ -800,7 +850,7 @@ remotePort = {remotePort}
         with open(vm_path / "Vagrantfile", "w") as f:
             f.write(vagrantfile_content)
 
-        background_tasks.add_task(stream_vagrant_up, str(vm_path))
+        background_tasks.add_task(background_provision_vm, new_vm_record.id, str(vm_path))
         reload_frpc_background(background_tasks)
 
         ssh_port = vm_rules_list[0]['remotePort']
@@ -847,11 +897,17 @@ async def start_vm(
     if not vm:
         raise HTTPException(status_code=403, detail="Forbidden: VM not found or you do not own it.")
     
+    result = await db.execute(select(VM).where(VM.id == vm.id))
+    vm_obj = result.scalars().first()
+    if vm_obj:
+        vm_obj.status = "Starting"
+        await db.commit()
+    
     vm_path = VMS_DIR / vm.name
     if not vm_path.exists():
         raise HTTPException(status_code=404, detail="VM directory not found.")
     
-    background_tasks.add_task(stream_vagrant_up, str(vm_path))
+    background_tasks.add_task(background_provision_vm,vm.id ,str(vm_path))
     return {"message": f"VM '{vm.name}' is booting..."}
 #endregion
 
@@ -873,7 +929,7 @@ async def stop_vm(
         raise HTTPException(status_code=404, detail="VM directory not found.")
         
     # You should create a 'stream_vagrant_halt' function for this
-    background_tasks.add_task(stream_vagrant_halt, str(vm_path))
+    background_tasks.add_task(background_stop_vm, vm.id, str(vm_path))
     return {"message": f"VM '{vm.name}' is stopping."}
 #endregion
 

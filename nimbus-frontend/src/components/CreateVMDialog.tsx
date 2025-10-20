@@ -17,8 +17,11 @@ interface CreateVMDialogProps {
 const OS_IMAGES = [
   { value: "ubuntu/jammy64", label: "Ubuntu 22.04 (Jammy)" },
   { value: "ubuntu/focal64", label: "Ubuntu 20.04 (Focal)" },
+  { value: "ubuntu/bionic64", label: "Ubuntu 18.04 (Bionic)" },
   { value: "debian/bullseye64", label: "Debian 11 (Bullseye)" },
-  { value: "centos/stream9", label: "CentOS Stream 9" },
+  { value: "eurolinux-vagrant/centos-stream-8", label: "CentOS Stream 8" },
+  { value: "eurolinux-vagrant/centos-stream-9", label: "CentOS Stream 9" },
+  
 ];
 
 export function CreateVMDialog({ open, onOpenChange, onSuccess }: CreateVMDialogProps) {

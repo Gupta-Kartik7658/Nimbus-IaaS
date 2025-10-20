@@ -20,7 +20,7 @@ export interface VM {
   private_ip: string;
   inbound_rules: InboundRule[];
   owner_id: number;
-  status?: "running" | "stopped" | "pending";
+  status?: "Provisioning" | "Starting" | "Active" | "Stopping" | "Stopped" | "Deleting" | "Error";
 }
 
 export interface InboundRule {
