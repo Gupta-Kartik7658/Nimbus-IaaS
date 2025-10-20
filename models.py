@@ -1,6 +1,8 @@
 from fastapi_users.db import SQLAlchemyBaseUserTableUUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy import String, Integer, JSON, ForeignKey, Text, UniqueConstraint
+from sqlalchemy import Enum
+import enum
 
 # This is the base class for all your database tables
 class Base(DeclarativeBase):
@@ -11,6 +13,15 @@ class User(SQLAlchemyBaseUserTableUUID, Base):
     pass
 
 # This is your new VM table
+class VMStatus(str, enum.Enum):
+    provisioning = "Provisioning"
+    starting = "Starting"
+    active = "Active"
+    stopping = "Stopping"
+    stopped = "Stopped"
+    deleting = "Deleting"
+    error = "Error"
+    
 class VM(Base):
     __tablename__ = "vms"
 
@@ -27,6 +38,9 @@ class VM(Base):
     
     # Store the list of rule objects directly as JSON
     inbound_rules: Mapped[dict] = mapped_column(JSON)
+    status: Mapped[VMStatus] = mapped_column(
+        Enum(VMStatus), default=VMStatus.provisioning, nullable=False
+    )
     
     # This is the critical link back to the user who owns the VM
     owner_id: Mapped[str] = mapped_column(ForeignKey("user.id"))
