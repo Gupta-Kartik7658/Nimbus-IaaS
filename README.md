@@ -51,7 +51,7 @@ All communications are secured with **HTTPS** and **SSL/TLS**, and network acces
 
 The architecture of Nimbus-IaaS is designed to emulate cloud-like VM provisioning while running locally:
 
-![System Architecture](SystemArchitecture2.png)
+![System Architecture](SystemDiagram2Dark.png)
 
 **Highlights:**
 
@@ -128,7 +128,7 @@ npm install
 npm run dev
 ```
 
-The frontend is available at `http://localhost:5173`.
+The frontend is available at `http://localhost:8080`.
 
 ---
 

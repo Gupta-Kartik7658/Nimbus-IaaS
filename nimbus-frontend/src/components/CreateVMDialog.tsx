@@ -156,7 +156,7 @@ export function CreateVMDialog({ open, onOpenChange, onSuccess }: CreateVMDialog
                 id="cpu"
                 type="number"
                 min="1"
-                max="16"
+                max="4"
                 value={formData.cpu}
                 onChange={(e) => setFormData({ ...formData, cpu: e.target.value })}
               />
