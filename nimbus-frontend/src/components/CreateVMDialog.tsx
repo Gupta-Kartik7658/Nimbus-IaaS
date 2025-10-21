@@ -30,8 +30,8 @@ export function CreateVMDialog({ open, onOpenChange, onSuccess }: CreateVMDialog
   const [formData, setFormData] = useState({
     name: "",
     key_name: "",
-    ram: "2048",
-    cpu: "2",
+    ram: "1024",
+    cpu: "1",
     image: "ubuntu/jammy64",
     provisioning_script: "",
   });
@@ -79,8 +79,8 @@ export function CreateVMDialog({ open, onOpenChange, onSuccess }: CreateVMDialog
       setFormData({
         name: "",
         key_name: "",
-        ram: "2048",
-        cpu: "2",
+        ram: "1024",
+        cpu: "1",
         image: "ubuntu/jammy64",
         provisioning_script: "",
       });
@@ -167,8 +167,8 @@ export function CreateVMDialog({ open, onOpenChange, onSuccess }: CreateVMDialog
               <Input
                 id="ram"
                 type="number"
-                min="512"
-                step="512"
+                min="256"
+                step="256"
                 value={formData.ram}
                 onChange={(e) => setFormData({ ...formData, ram: e.target.value })}
               />
@@ -179,7 +179,7 @@ export function CreateVMDialog({ open, onOpenChange, onSuccess }: CreateVMDialog
             <Label htmlFor="script">Provisioning Script (Optional)</Label>
             <Textarea
               id="script"
-              placeholder="#!/bin/bash&#10;apt-get update&#10;apt-get install -y nginx"
+              placeholder="apt-get update&#10;apt-get install -y nginx"
               value={formData.provisioning_script}
               onChange={(e) => setFormData({ ...formData, provisioning_script: e.target.value })}
               rows={5}

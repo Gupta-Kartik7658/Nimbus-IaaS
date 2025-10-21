@@ -95,7 +95,7 @@ export function SSHKeysDialog({ open, onOpenChange }: SSHKeysDialogProps) {
             <div className="flex gap-2">
               <Input
                 id="keyName"
-                placeholder="my-ssh-key"
+                placeholder="newKey"
                 value={newKeyName}
                 onChange={(e) => setNewKeyName(e.target.value)}
                 className="flex-1"

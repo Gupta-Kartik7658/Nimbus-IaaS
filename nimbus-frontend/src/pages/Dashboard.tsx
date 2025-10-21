@@ -70,8 +70,8 @@ export default function Dashboard() {
               <Cloud className="w-5 h-5 text-white" />
             </div>
             <div>
-              <h1 className="text-xl font-bold">Nimbus Cloud</h1>
-              <p className="text-xs text-muted-foreground">Infrastructure Management</p>
+              <h1 className="text-xl font-bold">Nimbus IaaS</h1>
+              <p className="text-xs text-muted-foreground">Cloud Infrastructure Management</p>
             </div>
           </div>
           <div className="flex items-center gap-2">
