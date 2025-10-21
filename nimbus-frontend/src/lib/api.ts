@@ -1,4 +1,4 @@
-const API_BASE_URL = "http://13.233.204.203:8000";
+const API_BASE_URL = "https://api.nimbus-iaas.gupta-kartik.xyz";
 
 export interface LoginRequest {
   username: string;
