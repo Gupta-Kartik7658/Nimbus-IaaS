@@ -1,0 +1,9 @@
+boto3==1.40.11
+botocore==1.40.11
+cryptography==42.0.8
+fastapi==0.119.1
+fastapi_users==14.0.1
+psutil==7.0.0
+pydantic==2.12.3
+python-dotenv==1.1.1
+SQLAlchemy==2.0.44
