@@ -35,7 +35,7 @@ export default function Dashboard() {
   // 🔁 Poll every 5 seconds to refresh VM status
   const interval = setInterval(() => {
     loadVMs();
-  }, 30000);
+  }, 40000);
 
   // Cleanup when component unmounts
   return () => clearInterval(interval);

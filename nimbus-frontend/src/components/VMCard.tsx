@@ -104,7 +104,7 @@ export function VMCard({ vm, onDelete, onUpdate }: VMCardProps) {
     await api.startVM(vm.name);
     toast.success(`VM ${vm.name} is starting...`);
     onUpdate(); // immediate refresh
-    setTimeout(onUpdate, 20000); // delayed refresh for background update
+     // delayed refresh for background update
   } catch (error: any) {
     toast.error(error.message || "Failed to start VM");
   } finally {
@@ -118,7 +118,7 @@ export function VMCard({ vm, onDelete, onUpdate }: VMCardProps) {
     await api.stopVM(vm.name);
     toast.success(`VM ${vm.name} is stopping...`);
     onUpdate();
-    setTimeout(onUpdate, 10000);
+    
   } catch (error: any) {
     toast.error(error.message || "Failed to stop VM");
   } finally {
@@ -133,7 +133,7 @@ const handleDelete = async () => {
     await api.deleteVM(vm.name);
     toast.success(`VM ${vm.name} deletion scheduled`);
     onDelete(); // immediate refresh
-    setTimeout(onDelete, 10000); // delayed refresh for background deletion
+     // delayed refresh for background deletion
   } catch (error: any) {
     toast.error(error.message || "Failed to delete VM");
   } finally {
