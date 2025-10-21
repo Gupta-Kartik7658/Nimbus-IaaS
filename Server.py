@@ -87,7 +87,9 @@ app = FastAPI(
 # This tells the backend to accept requests from your React app's origin
 origins = [
     "http://localhost:5173",
-    "http://localhost:8080"# The address of your React frontend
+    "http://localhost:8080",
+    "https://nimbus-iaas.gupta-kartik.xyz",
+    "https://nimbus-iaas.vercel.app" # The address of your React frontend
 ]
 
 app.add_middleware(
