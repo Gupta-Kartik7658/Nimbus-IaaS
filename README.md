@@ -149,14 +149,6 @@ The frontend is available at `http://localhost:8080`.
 
 ---
 
-## Roadmap
-
-- [ ] User authentication (multi-user support)
-- [ ] Real-time VM resource monitoring (CPU/RAM)
-- [ ] Docker container support
-- [ ] Enhanced Vagrant/provisioning logs in UI
-- [ ] VM snapshot management (create/restore)
-
 See [open issues](https://github.com/Gupta-Kartik7658/Nimbus-IaaS/issues) for details.
 
 ---
